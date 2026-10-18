@@ -4,22 +4,24 @@ hospital_cleaner.py
 -------------------
 Hospital data cleaning pipeline.
 
-覆盖 SKILL.md 15 类中的以下 9 类(其余 6 类见文末说明,目前只有规则描述、无脚本实现):
+覆盖 SKILL.md 15 类中的以下 12 类(其余 3 类只有规则描述、无脚本实现):
 
-    已实现 1  缺失值处理          handle_missing()
-    已实现 2  异常值与错误值      detect_outliers()
-    已实现 4  重复数据            deduplicate()
-    已实现 5  逻辑一致性          check_logic()
-    已实现 6  编码标准化          standardize_encodings()
-    已实现 7  时间数据            build_temporal_vars()
-    已实现 8  隐私脱敏            deidentify()
-    已实现 12 衍生变量            engineer_features()/charlson_cci.py
-    已实现 15 质控与可追溯        generate_quality_report()
-    另有 0    数据画像            profile_data()
+    0  数据画像            profile_data()
+    1  缺失值处理          handle_missing()
+    2  异常值与错误值      detect_outliers()
+    3  小样本抑制          scripts/small_count_suppress.py
+    4  重复数据            deduplicate()
+    5  逻辑一致性          check_logic()
+    6  编码标准化          standardize_encodings()
+    7  时间数据            build_temporal_vars()
+    8  隐私脱敏            deidentify()
+    9  数据结构清洗        clean_structure() / to_long() / to_wide()
+    12 衍生变量            engineer_features() / charlson_cci.py
+    13 标准化缩放          standardize_scales() / apply_scaling()
+    15 质控与可追溯        generate_quality_report()
 
 尚未实现(SKILL.md 有描述、脚本无对应函数):
-    3  小样本抑制(n<5)/ 9 数据结构清洗 / 10 文本与 NLP 清洗 /
-    11 数据来源核对与血缘 / 13 标准化缩放 / 14 数据集成
+    10 文本与 NLP 清洗 / 11 数据来源核对与血缘 / 14 数据集成
 
 Usage:
     python hospital_cleaner.py --input raw_data.csv --output output/
@@ -170,6 +172,104 @@ def profile_data(df: pd.DataFrame, include_samples: bool = False) -> dict:
 # ─────────────────────────────────────────────
 # Category 1 — Missing Data
 # ─────────────────────────────────────────────
+# 列名像标识符/编码 —— 这类列不做数值强转(会丢前导零、破坏编码语义)
+_ID_LIKE_PATTERNS = [
+    "id", "code", "编号", "编码", "卡号", "病历号", "住院号", "门诊号",
+    "phone", "tel", "mobile", "zip", "postcode", "icd", "序号",
+]
+
+
+def _looks_like_identifier(col) -> bool:
+    name = str(col).lower()
+    return any(k in name for k in _ID_LIKE_PATTERNS)
+
+
+# ═══════════════════════════════════════════════
+# 类别 9 — 数据结构清洗
+# ═══════════════════════════════════════════════
+def clean_structure(df: pd.DataFrame, log_entries: list, coerce_numeric: bool = True,
+                    numeric_parse_rate: float = 0.95,
+                    categorical_max_unique: int = 0) -> pd.DataFrame:
+    """类型规范:把"看着是数字的文本列"转为数值型,可选降为 category。
+
+    Args:
+        coerce_numeric: 医院导出的 CSV 里检验值常被 Excel 当作文本存,
+            不转的话分位数 / 均值 / IQR 异常检测会**静默跳过**这些列 ——
+            不报错,但结果是错的。
+        numeric_parse_rate: 判定阈值 —— 非空值中可解析为数字的最低比例。
+        categorical_max_unique: >0 时,把唯一值数不超过它的文本列转为 category。
+
+    安全规则(避免把编码/标识符转坏):
+        * 列名像标识符/编码(id、code、编号、卡号、ICD、序号…)→ 跳过
+        * 疑似 PHI 列 → 跳过
+        * 任意非空值带前导零(如 "007")→ 跳过,避免丢零
+    """
+    df = df.copy()
+    converted, skipped_zero, made_cat = [], [], []
+
+    if coerce_numeric:
+        for col in _text_columns(df):
+            if _looks_like_identifier(col) or is_phi_column(col):
+                continue
+            non_null = df[col].dropna()
+            if len(non_null) == 0:
+                continue
+            cleaned = (non_null.astype(str).str.strip()
+                       .str.replace(",", "", regex=False))
+            if cleaned.str.match(r'^[+-]?0\d').any():
+                skipped_zero.append(col)
+                continue
+            parse_rate = pd.to_numeric(cleaned, errors="coerce").notna().mean()
+            if parse_rate >= numeric_parse_rate:
+                df[col] = pd.to_numeric(
+                    df[col].astype(str).str.strip().str.replace(",", "", regex=False),
+                    errors="coerce")
+                converted.append(col)
+
+    if categorical_max_unique > 0:
+        for col in _text_columns(df):
+            if is_phi_column(col):
+                continue
+            n_unique = df[col].nunique(dropna=True)
+            if 0 < n_unique <= categorical_max_unique:
+                df[col] = df[col].astype("category")
+                made_cat.append(col)
+
+    if converted:
+        log.info(f"结构清洗:文本→数值 {len(converted)} 列 {converted}")
+        log_entries.append({"category": "structure", "action": "text_to_numeric",
+                            "fields": converted})
+    if skipped_zero:
+        log.warning(f"含前导零,已跳过数值转换(保护编码):{skipped_zero}")
+        log_entries.append({"category": "structure", "action": "skipped_leading_zero",
+                            "fields": skipped_zero})
+    if made_cat:
+        log_entries.append({"category": "structure", "action": "to_category",
+                            "fields": made_cat})
+    return df
+
+
+def to_long(df, id_vars, value_vars=None, var_name="variable", value_name="value",
+            log_entries=None) -> pd.DataFrame:
+    """宽表 → 长表(melt)。"""
+    out = df.melt(id_vars=id_vars, value_vars=value_vars,
+                  var_name=var_name, value_name=value_name)
+    if log_entries is not None:
+        log_entries.append({"category": "structure", "action": "wide_to_long",
+                            "rows_from": int(len(df)), "rows_to": int(len(out))})
+    return out
+
+
+def to_wide(df, index, columns, values, log_entries=None, aggfunc="first") -> pd.DataFrame:
+    """长表 → 宽表(pivot);重复 (index, columns) 组合按 aggfunc 聚合。"""
+    out = df.pivot_table(index=index, columns=columns, values=values,
+                         aggfunc=aggfunc).reset_index()
+    if log_entries is not None:
+        log_entries.append({"category": "structure", "action": "long_to_wide",
+                            "rows_from": int(len(df)), "rows_to": int(len(out))})
+    return out
+
+
 def handle_missing(df: pd.DataFrame, critical_fields: list, log_entries: list) -> pd.DataFrame:
     """Handle missing values by field priority."""
     df = df.copy()
@@ -497,6 +597,94 @@ def engineer_features(df: pd.DataFrame, log_entries: list) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 # Category 15 — Quality Report
 # ─────────────────────────────────────────────
+SCALE_METHODS = ("zscore", "minmax", "robust")
+
+
+# ═══════════════════════════════════════════════
+# 类别 13 — 数据标准化 / 缩放
+# ═══════════════════════════════════════════════
+def standardize_scales(df: pd.DataFrame, method: str = "zscore", columns=None,
+                       log_entries=None, suffix: str = "_scaled"):
+    """标准化/缩放。
+
+    ⚠️ **仅用于建模前**。描述性统计与论文里的原始数值表都不要缩放,否则量纲失去意义。
+
+    默认生成新列 ``<col>_scaled``,**不覆盖原列** —— 缩放不可逆地丢掉尺度,
+    覆盖是这类脚本最常见的事故来源。
+
+    Returns:
+        (df_out, params):params 记录每列的变换参数,可用 apply_scaling() 对
+        新数据(测试集/后续队列)施加**完全相同**的变换。
+    """
+    if method not in SCALE_METHODS:
+        raise ValueError(f"未知缩放方法 {method!r};可选 {SCALE_METHODS}")
+    log_entries = log_entries if log_entries is not None else []
+    df = df.copy()
+    params = {}
+
+    if columns is None:
+        columns = [c for c in df.columns
+                   if pd.api.types.is_numeric_dtype(df[c])
+                   and not c.endswith(("_was_missing", "_flag", suffix))
+                   and not _looks_like_identifier(c)]
+
+    for col in columns:
+        if col not in df.columns:
+            log.warning(f"缩放跳过不存在的列:{col}")
+            continue
+        s = pd.to_numeric(df[col], errors="coerce")
+
+        if method == "zscore":
+            mu, sd = s.mean(), s.std()
+            if pd.isna(sd) or sd == 0:
+                log.warning(f"列 {col} 标准差为 0,跳过 z-score")
+                continue
+            df[f"{col}{suffix}"] = (s - mu) / sd
+            params[col] = {"method": "zscore", "mean": float(mu), "std": float(sd)}
+        elif method == "minmax":
+            lo, hi = s.min(), s.max()
+            if pd.isna(lo) or hi == lo:
+                log.warning(f"列 {col} 取值范围为单点,跳过 min-max")
+                continue
+            df[f"{col}{suffix}"] = (s - lo) / (hi - lo)
+            params[col] = {"method": "minmax", "min": float(lo), "max": float(hi)}
+        else:  # robust:对极端值不敏感,医院数据里比 z-score 更稳
+            med = s.median()
+            iqr = s.quantile(0.75) - s.quantile(0.25)
+            if pd.isna(iqr) or iqr == 0:
+                log.warning(f"列 {col} IQR 为 0,跳过 robust 缩放")
+                continue
+            df[f"{col}{suffix}"] = (s - med) / iqr
+            params[col] = {"method": "robust", "median": float(med), "iqr": float(iqr)}
+
+        log_entries.append({"category": "scaling", "field": col, "action": method})
+
+    if params:
+        log.info(f"已缩放 {len(params)} 列(method={method});参数可用 apply_scaling() 复用")
+    return df, params
+
+
+def apply_scaling(df: pd.DataFrame, params: dict, suffix: str = "_scaled") -> pd.DataFrame:
+    """用 standardize_scales() 返回的 params 对新数据施加**相同**变换。
+
+    训练集/测试集必须用同一套参数,否则既是数据泄漏也是量纲不一致。
+    """
+    df = df.copy()
+    for col, p in params.items():
+        if col not in df.columns:
+            log.warning(f"apply_scaling:目标数据缺少列 {col},跳过")
+            continue
+        s = pd.to_numeric(df[col], errors="coerce")
+        if p["method"] == "zscore":
+            df[f"{col}{suffix}"] = (s - p["mean"]) / p["std"]
+        elif p["method"] == "minmax":
+            span = (p["max"] - p["min"]) or 1
+            df[f"{col}{suffix}"] = (s - p["min"]) / span
+        elif p["method"] == "robust":
+            df[f"{col}{suffix}"] = (s - p["median"]) / (p["iqr"] or 1)
+    return df
+
+
 def generate_quality_report(df_before: pd.DataFrame, df_after: pd.DataFrame,
                               log_entries: list, output_dir: Path) -> str:
     """Generate a markdown quality report."""
@@ -585,6 +773,10 @@ def run_pipeline(input_path: str, output_dir: str, config: dict = None) -> None:
     critical_fields = config.get("critical_fields", ["patient_id", "admit_date"])
     dedup_keys      = config.get("dedup_keys",      ["patient_id", "admit_date"])
 
+    # 类别 9 — 先做结构清洗(文本→数值)。否则后续分位数/异常检测会静默跳过文本列
+    df = clean_structure(df, log_entries,
+                         coerce_numeric=bool(config.get("coerce_numeric_types", True)))
+
     df = handle_missing(df, critical_fields, log_entries)
     df = deduplicate(df, dedup_keys, log_entries)
     df = standardize_encodings(df, log_entries)
@@ -601,8 +793,19 @@ def run_pipeline(input_path: str, output_dir: str, config: dict = None) -> None:
                     "仅在已获伦理批准且落盘环境受控时才这样用。")
         log_entries.append({"category": "deidentify", "action": "skipped_by_config"})
 
-    # Save outputs
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    # 类别 13 — 标准化缩放:默认关闭,只在建模前显式开启
+    scale_method = config.get("scale_method")
+    if scale_method:
+        df, scale_params = standardize_scales(df, method=scale_method,
+                                              columns=config.get("scale_columns"),
+                                              log_entries=log_entries)
+        with open(output_path / f"05_scaler_params_{ts}.json", "w", encoding="utf-8") as f:
+            json.dump(scale_params, f, indent=2, ensure_ascii=False)
+        log.info(f"缩放参数已存:{len(scale_params)} 列 → 05_scaler_params_{ts}.json")
+
+    # Save outputs
     _write_dataset(df, output_path, ts, log_entries)
 
     log_df = pd.DataFrame(log_entries)

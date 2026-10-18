@@ -7,10 +7,11 @@
     python tests/test_pipeline.py     # 直接跑,失败返回退出码 1
     pytest tests/                     # 或用 pytest
 
-覆盖三块:
+覆盖四块:
   1. Charlson CCI —— 权重、三组层级互斥、年龄分
-  2. 清洗各阶段 —— 缺失 / 异常 / 编码 / 逻辑 / 去重 / 脱敏 / 衍生
-  3. 端到端 + **PHI 回归** —— 画像 JSON 及所有产物不得出现任何 PHI 原值
+  2. 清洗各阶段 —— 缺失 / 异常 / 编码 / 逻辑 / 去重 / 脱敏 / 衍生 / 结构清洗 / 缩放
+  3. 小计数抑制 —— 主抑制、二次抑制、0 不抑制
+  4. 端到端 + **PHI 回归** —— 画像 JSON 及所有产物不得出现任何 PHI 原值
 
 其中 PHI 回归对应审计发现:原版 profile_data() 会在脱敏前把每列前 3 个原值
 写进 00_profile_raw.json,导致姓名/身份证/电话直接落盘。
@@ -29,6 +30,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from charlson_cci import charlson_age_points, compute_cci  # noqa: E402
 import hospital_cleaner as hc  # noqa: E402
+import small_count_suppress as scs  # noqa: E402
 
 
 # ══════════════════════════════════════════════
@@ -205,7 +207,147 @@ def test_engineer_features_preserves_row_order():
 
 
 # ══════════════════════════════════════════════
-# 4. 端到端 + PHI 回归
+# 5. 类别 9 — 数据结构清洗
+# ══════════════════════════════════════════════
+def test_clean_structure_converts_numeric_text():
+    """检验值被 Excel 当文本存是医院 CSV 的常态;不转则分位数/异常检测静默跳过。"""
+    df = pd.DataFrame({"lab_value": ["12.5", "13", "14.2", "11"],
+                       "dept": ["内科", "内科", "外科", "外科"]})
+    out = hc.clean_structure(df, [])
+    assert pd.api.types.is_numeric_dtype(out["lab_value"])
+    assert out.loc[0, "lab_value"] == 12.5
+    assert not pd.api.types.is_numeric_dtype(out["dept"])
+
+
+def test_clean_structure_skips_identifiers_and_leading_zeros():
+    df = pd.DataFrame({"patient_id": ["1001", "1002"],
+                       "icd10_code": ["I50", "E11"],
+                       "ward_no": ["007", "012"],
+                       "age": ["70", "60"]})
+    out = hc.clean_structure(df, [])
+    for col in ("patient_id", "icd10_code", "ward_no"):
+        assert not pd.api.types.is_numeric_dtype(out[col]), \
+            f"{col} 不该被转成数值(id/code 名或带前导零)"
+    assert pd.api.types.is_numeric_dtype(out["age"])
+
+
+def test_clean_structure_long_wide_roundtrip():
+    df = pd.DataFrame({"patient_id": ["P1", "P2"], "wbc": [5.0, 6.0], "crp": [1.0, 2.0]})
+    lng = hc.to_long(df, id_vars=["patient_id"], value_vars=["wbc", "crp"])
+    assert len(lng) == 4
+    assert set(lng["variable"]) == {"wbc", "crp"}
+    wide = hc.to_wide(lng, index="patient_id", columns="variable", values="value")
+    assert {"patient_id", "wbc", "crp"} <= set(wide.columns)
+
+
+# ══════════════════════════════════════════════
+# 6. 类别 13 — 标准化缩放
+# ══════════════════════════════════════════════
+def test_standardize_scales_zscore():
+    df = pd.DataFrame({"age": [10, 20, 30, 40]})
+    out, params = hc.standardize_scales(df, method="zscore")
+    assert "age_scaled" in out.columns
+    assert "age" in out.columns, "原列必须保留 —— 覆盖是不可逆事故"
+    assert abs(out["age_scaled"].mean()) < 1e-9
+    assert abs(out["age_scaled"].std(ddof=1) - 1.0) < 1e-9
+    assert params["age"]["std"] > 0
+
+
+def test_standardize_scales_minmax_and_robust():
+    df = pd.DataFrame({"x": [1.0, 2.0, 3.0, 4.0]})
+    out, _ = hc.standardize_scales(df, method="minmax", columns=["x"])
+    assert out["x_scaled"].min() == 0.0
+    assert out["x_scaled"].max() == 1.0
+    out2, p2 = hc.standardize_scales(df, method="robust", columns=["x"])
+    assert p2["x"]["method"] == "robust"
+    assert pd.api.types.is_numeric_dtype(out2["x_scaled"])
+
+
+def test_standardize_scales_rejects_unknown_method():
+    try:
+        hc.standardize_scales(pd.DataFrame({"x": [1.0, 2.0]}), method="nope")
+    except ValueError:
+        return
+    raise AssertionError("未知缩放方法应该报错")
+
+
+def test_standardize_scales_skips_identifier_columns():
+    df = pd.DataFrame({"patient_id": [1, 2, 3, 4], "x": [1.0, 2.0, 3.0, 4.0]})
+    _, params = hc.standardize_scales(df, method="zscore")
+    assert "x" in params
+    assert "patient_id" not in params, "ID 列不该被缩放"
+
+
+def test_apply_scaling_reproduces_training_transform():
+    train = pd.DataFrame({"x": [10.0, 20.0, 30.0]})
+    _, params = hc.standardize_scales(train, method="zscore", columns=["x"])
+    got = hc.apply_scaling(pd.DataFrame({"x": [40.0]}), params)["x_scaled"].iloc[0]
+    expect = (40.0 - train["x"].mean()) / train["x"].std()
+    assert abs(got - expect) < 1e-9, "测试集必须用训练集参数,否则是数据泄漏"
+
+
+# ══════════════════════════════════════════════
+# 7. 类别 3 — 小计数抑制
+# ══════════════════════════════════════════════
+def test_suppress_primary_only():
+    df = pd.DataFrame({"dept": ["A", "B", "C"], "n": [3, 10, 12]})
+    out, info = scs.suppress_small_counts(df, count_col="n", group_cols=["dept"],
+                                          threshold=5, secondary=False)
+    assert info["primary"] == 1 and info["secondary"] == 0
+    assert bool(out.loc[0, "suppressed"]) is True
+    assert bool(out.loc[1, "suppressed"]) is False
+    assert pd.isna(out.loc[0, "n"])
+    assert out.loc[0, "suppression_reason"] == "primary"
+
+
+def test_suppress_secondary_kicks_in():
+    """n=3 被抑制后,合计可反推出它 → 必须再抑制一个最小单元(B=10)。"""
+    df = pd.DataFrame({"dept": ["A", "B", "C"], "n": [3, 10, 12]})
+    out, info = scs.suppress_small_counts(df, count_col="n", group_cols=["dept"],
+                                          threshold=5, secondary=True)
+    assert info["primary"] == 1
+    assert info["secondary"] == 1
+    assert int(out["suppressed"].sum()) == 2
+    assert out.loc[1, "suppression_reason"] == "secondary"
+
+
+def test_suppress_zero_is_not_suppressed():
+    df = pd.DataFrame({"dept": ["A", "B"], "n": [0, 7]})
+    out, info = scs.suppress_small_counts(df, count_col="n", group_cols=["dept"],
+                                          threshold=5, secondary=False)
+    assert info["suppressed_rows"] == 0, "零计数不泄露个体,不该被抑制"
+
+
+def test_suppress_two_dimensional():
+    df = pd.DataFrame({"dept": ["A", "A", "B", "B"],
+                       "age": ["<5", "5+", "<5", "5+"],
+                       "n": [3, 20, 8, 9]})
+    out, info = scs.suppress_small_counts(df, count_col="n",
+                                          group_cols=["dept", "age"], threshold=5)
+    assert info["primary"] == 1
+    assert info["suppressed_rows"] >= 2, "列联表里单抑制行/列会连锁触发二次抑制"
+
+
+def test_suppress_marker_and_raw_aggregation():
+    # A 出现 2 次、B 出现 6 次 → 只有 A 需抑制(写完夹具先把计数算清楚再断言)
+    raw = pd.DataFrame({"dept": ["A", "A"] + ["B"] * 6})
+    out, info = scs.suppress_small_counts(raw, group_cols=["dept"], threshold=5,
+                                          secondary=False, marker="<5")
+    assert info["primary"] == 1
+    assert out.loc[out["suppressed"], "count"].iloc[0] == "<5"
+    assert not out.loc[~out["suppressed"], "suppressed"].any()
+
+
+def test_suppress_rejects_bad_threshold():
+    try:
+        scs.suppress_small_counts(pd.DataFrame({"n": [1]}), count_col="n", threshold=1)
+    except ValueError:
+        return
+    raise AssertionError("threshold < 2 应该报错")
+
+
+# ══════════════════════════════════════════════
+# 8. 端到端 + PHI 回归
 # ══════════════════════════════════════════════
 def test_end_to_end_no_phi_leaks_into_outputs():
     src = pd.DataFrame({

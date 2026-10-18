@@ -56,7 +56,7 @@ git clone https://github.com/leoncool23/hospital-data-cleaning-skills-for-opencl
 ### 验证安装
 
 ```bash
-python tests/test_pipeline.py   # 应输出 ALL PASS (17 tests)
+python tests/test_pipeline.py   # 应输出 ALL PASS (31 tests)
 ```
 
 ### OpenClaw 多 Agent 分工
@@ -104,7 +104,11 @@ python scripts/hospital_cleaner.py \
   "keep_pseudonym":  false,
 
   "profile_samples": false,
-  "null_hard_bound": false
+  "null_hard_bound": false,
+
+  "coerce_numeric_types": true,
+  "scale_method": null,
+  "scale_columns": null
 }
 ```
 
@@ -116,8 +120,14 @@ python scripts/hospital_cleaner.py \
 | `keep_pseudonym` | `false` | 姓名是否保留为 `SUBJ_<hash8>` 伪名 |
 | `profile_samples` | `false` | ⚠️ 是否把每列前 3 个**原值**写进画像 JSON。**含 PHI 时绝不要开**(见下方安全说明) |
 | `null_hard_bound` | `false` | 硬边界外的值是否置空。默认只打标记保留原值 |
+| `coerce_numeric_types` | `true` | 把"看着是数字的文本列"转为数值。医院 CSV 里检验值常被 Excel 当文本存,不转则分位数/异常检测会**静默跳过**;id/code/编号类列与带前导零的值会自动跳过 |
+| `scale_method` | `null`(关闭) | `zscore` / `minmax` / `robust`。⚠️ **仅建模前**;产物为 `<col>_scaled` 新列,原列保留,参数存 `05_scaler_params_*.json` |
+| `scale_columns` | `null` | 指定只缩放哪几列;不给则自动选数值列 |
 
 命令行等价开关:`--profile-samples`。
+
+> `scale_method` 打开后产物多一个 `05_scaler_params_<时间戳>.json`,里面是每列的变换参数。
+> 用 `apply_scaling(df, params)` 对测试集/后续队列施加**完全相同**的变换 —— 用两套参数是数据泄漏。
 
 ---
 
@@ -160,6 +170,31 @@ output/
 > 与代码实际写出的文件名不一致 —— 按代码为准,本文已改正。
 
 ---
+
+## 发布前:小计数抑制（类别 3）
+
+发布聚合表前抑制小计数单元,防止从合计反推出个体。**这是独立脚本**,不动主流水线
+(主流水线处理明细,这个处理聚合表):
+
+```bash
+# 已聚合的表
+python scripts/small_count_suppress.py --input agg.csv --count-col n \
+    --group 科室 --out suppressed.csv
+
+# 原始明细(现算计数)
+python scripts/small_count_suppress.py --input raw.csv --group 科室 --group 年龄段 \
+    --threshold 5 --marker "<5" --out suppressed.csv
+```
+
+两种抑制:
+
+- **主抑制**:计数落在 `[1, threshold)` 的单元抑制(**0 不抑制** —— 零计数不泄露个体)
+- **二次抑制**:某行/列只剩一个被抑制单元时,用该行/列的合计相减即可反推出它,
+  所以必须在同行/列再抑制一个最小单元;这会连锁产生新的单抑制行/列,故循环到稳定
+
+⚠️ 二次抑制的前提是「边际合计已公布」。若合计不公开,用 `--no-secondary` 只做主抑制。
+
+输出会追加 `suppressed`(布尔)与 `suppression_reason`(primary / secondary)两列。
 
 ## 重要提醒
 
