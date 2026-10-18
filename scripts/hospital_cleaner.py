@@ -2,8 +2,26 @@
 """
 hospital_cleaner.py
 -------------------
-Full hospital data cleaning pipeline.
-Implements all 15 categories from SKILL.md.
+Hospital data cleaning pipeline.
+
+覆盖 SKILL.md 15 类中的以下 12 类(其余 3 类只有规则描述、无脚本实现):
+
+    0  数据画像            profile_data()
+    1  缺失值处理          handle_missing()
+    2  异常值与错误值      detect_outliers()
+    3  小样本抑制          scripts/small_count_suppress.py
+    4  重复数据            deduplicate()
+    5  逻辑一致性          check_logic()
+    6  编码标准化          standardize_encodings()
+    7  时间数据            build_temporal_vars()
+    8  隐私脱敏            deidentify()
+    9  数据结构清洗        clean_structure() / to_long() / to_wide()
+    12 衍生变量            engineer_features() / charlson_cci.py
+    13 标准化缩放          standardize_scales() / apply_scaling()
+    15 质控与可追溯        generate_quality_report()
+
+尚未实现(SKILL.md 有描述、脚本无对应函数):
+    10 文本与 NLP 清洗 / 11 数据来源核对与血缘 / 14 数据集成
 
 Usage:
     python hospital_cleaner.py --input raw_data.csv --output output/
@@ -59,12 +77,67 @@ DATE_FORMATS = [
     '%Y%m%d', '%Y-%m-%d %H:%M:%S', '%Y/%m/%d %H:%M',
 ]
 
+# ─────────────────────────────────────────────
+# PHI 字段识别(画像取样与脱敏共用)
+# ─────────────────────────────────────────────
+# 精确字段名:命中即在 deidentify() 里删除或伪名化
+PHI_FIELDS = [
+    "patient_name", "name", "姓名",
+    "id_number", "national_id", "身份证",
+    "phone", "mobile", "telephone", "电话",
+    "address", "住址",
+    "email", "邮箱",
+]
+
+# 子串模式:用于**告警**和**画像取样跳过**。
+# 刻意不含裸 "name",否则会命中 drug_name / diagnosis_name 这类合法列。
+PHI_PATTERNS = [
+    "姓名", "身份证", "电话", "手机", "住址", "邮箱",
+    "监护人", "家属", "联系人", "联系方式", "病历号", "住院号", "门诊号",
+    "patient_name", "id_number", "national_id", "mrn", "phone", "mobile",
+    "telephone", "address", "email", "contact",
+]
+
+
+def is_phi_column(col) -> bool:
+    """列名是否疑似 PHI。宁多勿漏,误报由人工复核。"""
+    name = str(col).lower()
+    return any(p in name for p in PHI_PATTERNS)
+
+
+# ─────────────────────────────────────────────
+# 文本列判定(跨 pandas 2/3)
+# ─────────────────────────────────────────────
+def _is_text_series(s: pd.Series) -> bool:
+    """是否为文本列。
+
+    ⚠️ pandas 3.0 起字符串列的 dtype 是 ``str`` 而不再是 ``object``,
+    因此 ``s.dtype == "object"`` 在新版上**恒为假、整段逻辑静默跳过**。
+    原版用这个判断做日期标准化,导致日期原样流入输出且不报错。
+    """
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        return False
+    return bool(pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s))
+
+
+def _text_columns(df: pd.DataFrame) -> list:
+    """文本列名列表。不用 select_dtypes("object"):pandas 3 会对它发弃用告警。"""
+    return [c for c in df.columns if _is_text_series(df[c])]
+
 
 # ─────────────────────────────────────────────
 # Phase 0 — Data Profiling
 # ─────────────────────────────────────────────
-def profile_data(df: pd.DataFrame) -> dict:
-    """Generate pre/post cleaning profile report."""
+def profile_data(df: pd.DataFrame, include_samples: bool = False) -> dict:
+    """Generate pre/post cleaning profile report.
+
+    Args:
+        include_samples: 是否把每列前 3 个**原值**写进画像 JSON。
+
+    ⚠️ 默认 False。画像是在脱敏**之前**生成的,原值可能包含姓名、身份证、电话;
+    一旦落盘,01/02/03 号文件再干净也白搭 —— 直接违反"清洗日志不得含 PHI"的核心原则。
+    仅在已确认数据不含 PHI 时才开;即便开启,疑似 PHI 列也会被跳过。
+    """
     report = {
         "timestamp": datetime.now().isoformat(),
         "rows": int(len(df)),
@@ -72,8 +145,25 @@ def profile_data(df: pd.DataFrame) -> dict:
         "missing_pct": {c: round(float(df[c].isnull().mean() * 100), 2) for c in df.columns},
         "duplicate_rows": int(df.duplicated().sum()),
         "dtypes": {c: str(df[c].dtype) for c in df.columns},
-        "sample_values": {c: df[c].dropna().head(3).tolist() for c in df.columns},
+        "nunique": {c: int(df[c].nunique(dropna=True)) for c in df.columns},
+        "sample_values_omitted": not include_samples,
     }
+
+    if include_samples:
+        skipped = [c for c in df.columns if is_phi_column(c)]
+        report["sample_values"] = {
+            c: [str(v)[:40] for v in df[c].dropna().head(3).tolist()]
+            for c in df.columns if c not in skipped
+        }
+        if skipped:
+            report["sample_values_skipped_phi_columns"] = skipped
+        log.warning(
+            "画像已开启原值输出(--profile-samples / profile_samples=true)。"
+            "请确认数据不含 PHI;疑似 PHI 列已跳过:%s", skipped or "无"
+        )
+    else:
+        log.info("画像未输出任何原值(默认)。如需诊断取样请显式开启 --profile-samples。")
+
     log.info(f"Profile: {report['rows']} rows, {report['columns']} cols, "
              f"{report['duplicate_rows']} duplicates")
     return report
@@ -82,6 +172,104 @@ def profile_data(df: pd.DataFrame) -> dict:
 # ─────────────────────────────────────────────
 # Category 1 — Missing Data
 # ─────────────────────────────────────────────
+# 列名像标识符/编码 —— 这类列不做数值强转(会丢前导零、破坏编码语义)
+_ID_LIKE_PATTERNS = [
+    "id", "code", "编号", "编码", "卡号", "病历号", "住院号", "门诊号",
+    "phone", "tel", "mobile", "zip", "postcode", "icd", "序号",
+]
+
+
+def _looks_like_identifier(col) -> bool:
+    name = str(col).lower()
+    return any(k in name for k in _ID_LIKE_PATTERNS)
+
+
+# ═══════════════════════════════════════════════
+# 类别 9 — 数据结构清洗
+# ═══════════════════════════════════════════════
+def clean_structure(df: pd.DataFrame, log_entries: list, coerce_numeric: bool = True,
+                    numeric_parse_rate: float = 0.95,
+                    categorical_max_unique: int = 0) -> pd.DataFrame:
+    """类型规范:把"看着是数字的文本列"转为数值型,可选降为 category。
+
+    Args:
+        coerce_numeric: 医院导出的 CSV 里检验值常被 Excel 当作文本存,
+            不转的话分位数 / 均值 / IQR 异常检测会**静默跳过**这些列 ——
+            不报错,但结果是错的。
+        numeric_parse_rate: 判定阈值 —— 非空值中可解析为数字的最低比例。
+        categorical_max_unique: >0 时,把唯一值数不超过它的文本列转为 category。
+
+    安全规则(避免把编码/标识符转坏):
+        * 列名像标识符/编码(id、code、编号、卡号、ICD、序号…)→ 跳过
+        * 疑似 PHI 列 → 跳过
+        * 任意非空值带前导零(如 "007")→ 跳过,避免丢零
+    """
+    df = df.copy()
+    converted, skipped_zero, made_cat = [], [], []
+
+    if coerce_numeric:
+        for col in _text_columns(df):
+            if _looks_like_identifier(col) or is_phi_column(col):
+                continue
+            non_null = df[col].dropna()
+            if len(non_null) == 0:
+                continue
+            cleaned = (non_null.astype(str).str.strip()
+                       .str.replace(",", "", regex=False))
+            if cleaned.str.match(r'^[+-]?0\d').any():
+                skipped_zero.append(col)
+                continue
+            parse_rate = pd.to_numeric(cleaned, errors="coerce").notna().mean()
+            if parse_rate >= numeric_parse_rate:
+                df[col] = pd.to_numeric(
+                    df[col].astype(str).str.strip().str.replace(",", "", regex=False),
+                    errors="coerce")
+                converted.append(col)
+
+    if categorical_max_unique > 0:
+        for col in _text_columns(df):
+            if is_phi_column(col):
+                continue
+            n_unique = df[col].nunique(dropna=True)
+            if 0 < n_unique <= categorical_max_unique:
+                df[col] = df[col].astype("category")
+                made_cat.append(col)
+
+    if converted:
+        log.info(f"结构清洗:文本→数值 {len(converted)} 列 {converted}")
+        log_entries.append({"category": "structure", "action": "text_to_numeric",
+                            "fields": converted})
+    if skipped_zero:
+        log.warning(f"含前导零,已跳过数值转换(保护编码):{skipped_zero}")
+        log_entries.append({"category": "structure", "action": "skipped_leading_zero",
+                            "fields": skipped_zero})
+    if made_cat:
+        log_entries.append({"category": "structure", "action": "to_category",
+                            "fields": made_cat})
+    return df
+
+
+def to_long(df, id_vars, value_vars=None, var_name="variable", value_name="value",
+            log_entries=None) -> pd.DataFrame:
+    """宽表 → 长表(melt)。"""
+    out = df.melt(id_vars=id_vars, value_vars=value_vars,
+                  var_name=var_name, value_name=value_name)
+    if log_entries is not None:
+        log_entries.append({"category": "structure", "action": "wide_to_long",
+                            "rows_from": int(len(df)), "rows_to": int(len(out))})
+    return out
+
+
+def to_wide(df, index, columns, values, log_entries=None, aggfunc="first") -> pd.DataFrame:
+    """长表 → 宽表(pivot);重复 (index, columns) 组合按 aggfunc 聚合。"""
+    out = df.pivot_table(index=index, columns=columns, values=values,
+                         aggfunc=aggfunc).reset_index()
+    if log_entries is not None:
+        log_entries.append({"category": "structure", "action": "long_to_wide",
+                            "rows_from": int(len(df)), "rows_to": int(len(out))})
+    return out
+
+
 def handle_missing(df: pd.DataFrame, critical_fields: list, log_entries: list) -> pd.DataFrame:
     """Handle missing values by field priority."""
     df = df.copy()
@@ -117,7 +305,10 @@ def handle_missing(df: pd.DataFrame, critical_fields: list, log_entries: list) -
                                  "action": "dropped_high_missing", "count": int(n_miss)})
 
     # Categorical fields: fill with 'Unknown'
-    cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    # ⚠️ 不要写 select_dtypes(include=["object", "category"]):pandas 3 下字符串列
+    #    的 dtype 是 "str",依赖旧兼容行为会发 Pandas4Warning 并在未来失效。
+    cat_cols = _text_columns(df) + [c for c in df.columns
+                                    if isinstance(df[c].dtype, pd.CategoricalDtype)]
     for col in cat_cols:
         if col in critical_fields:
             continue
@@ -132,8 +323,19 @@ def handle_missing(df: pd.DataFrame, critical_fields: list, log_entries: list) -
 # ─────────────────────────────────────────────
 # Category 2 — Outlier Detection
 # ─────────────────────────────────────────────
-def detect_outliers(df: pd.DataFrame, log_entries: list) -> pd.DataFrame:
-    """Detect and flag outliers using hard bounds and IQR."""
+def detect_outliers(df: pd.DataFrame, log_entries: list,
+                    null_hard_bound: bool = False) -> pd.DataFrame:
+    """Detect and flag outliers using hard bounds and IQR.
+
+    Args:
+        null_hard_bound: 硬边界外的值是否直接置空。
+            默认 False —— 保留原值并只打标记,符合 SKILL.md 2.3
+            "异常值子类分类(不直接删除,先分类标记)"。
+            置空会丢失信息(3.4℃ 多半是 34℃ 的录入错误,删了就查不回来了)。
+
+    ⚠️ SKILL.md 2.4 要求"单位统一必须在异常检测之前"。本函数不做单位换算,
+       调用方须保证传入的列已是标准单位,否则硬边界判定会误杀。
+    """
     df = df.copy()
 
     # Hard boundary rules
@@ -144,9 +346,13 @@ def detect_outliers(df: pd.DataFrame, log_entries: list) -> pd.DataFrame:
         n = int(mask.sum())
         if n > 0:
             df[f"{field}_outlier_flag"] = np.where(mask, "HARD_BOUND", "OK")
-            df.loc[mask, field] = np.nan
+            if null_hard_bound:
+                df.loc[mask, field] = np.nan
+                action = "hard_bound_nulled"
+            else:
+                action = "hard_bound_flagged"
             log_entries.append({"category": "outlier", "field": field,
-                                 "action": "hard_bound_nulled", "count": n})
+                                 "action": action, "count": n})
 
     # IQR statistical outliers for remaining numeric fields
     for col in df.select_dtypes(include=[np.number]).columns:
@@ -263,16 +469,17 @@ def standardize_encodings(df: pd.DataFrame, log_entries: list) -> pd.DataFrame:
                                  "action": "invalid_flagged", "count": n})
 
     # Date fields
+    # ⚠️ 原版写的是 `if df[col].dtype == "object"`,pandas 3.0 起字符串 dtype 是 "str",
+    #    该条件恒为假 → 日期标准化整段静默空转,原始格式直接流到输出。
     date_fields = [c for c in df.columns if any(k in c.lower() for k in ["date", "time", "dt"])]
     for col in date_fields:
-        if df[col].dtype == "object":
+        if _is_text_series(df[col]):
             df[col] = df[col].apply(_safe_parse_date)
             log_entries.append({"category": "encoding", "field": col,
                                  "action": "date_standardized"})
 
     # String cleanup
-    str_cols = df.select_dtypes(include="object").columns
-    for col in str_cols:
+    for col in _text_columns(df):
         df[col] = df[col].apply(lambda x: re.sub(r'\s+', ' ', str(x)).strip()
                                  if pd.notnull(x) else x)
     return df
@@ -318,18 +525,21 @@ def build_temporal_vars(df: pd.DataFrame, log_entries: list) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 # Category 8 — De-identification
 # ─────────────────────────────────────────────
-PHI_FIELDS = [
-    "patient_name", "name", "姓名",
-    "id_number", "national_id", "身份证",
-    "phone", "mobile", "telephone", "电话",
-    "address", "住址",
-    "email", "邮箱",
-]
-
 def deidentify(df: pd.DataFrame, keep_pseudonym: bool, log_entries: list) -> pd.DataFrame:
-    """Remove or pseudonymize PHI fields."""
+    """Remove or pseudonymize PHI fields.
+
+    精确名命中 → 删除或伪名化;疑似列(子串命中但不在 PHI_FIELDS)→ **只告警不删**。
+    自动删疑似列会误伤 drug_name / diagnosis_name 之类的合法列,漏删比误删好救。
+    """
     df = df.copy()
     removed = []
+
+    suspected = [c for c in df.columns if is_phi_column(c) and c not in PHI_FIELDS]
+    if suspected:
+        log.warning(f"疑似 PHI 列(未自动删除,请人工确认后再决定):{suspected}")
+        log_entries.append({"category": "deidentify",
+                            "action": "suspected_phi_review_required",
+                            "fields": suspected})
     for field in PHI_FIELDS:
         if field in df.columns:
             if keep_pseudonym and field in ("patient_name", "name"):
@@ -368,23 +578,113 @@ def engineer_features(df: pd.DataFrame, log_entries: list) -> pd.DataFrame:
         log_entries.append({"category": "features", "action": "computed_bmi"})
 
     # Readmission flag (requires sorted data by patient + date)
-    if "patient_id" in df.columns and "admit_date" in df.columns:
+    if "patient_id" in df.columns and "admit_date" in df.columns and "discharge_date" in df.columns:
+        original_order = df.index
         df_sorted = df.sort_values(["patient_id", "admit_date"])
         df_sorted["prev_discharge"] = df_sorted.groupby("patient_id")["discharge_date"].shift(1)
-        if "discharge_date" in df.columns:
-            df_sorted["days_since_discharge"] = (
-                pd.to_datetime(df_sorted["admit_date"], errors="coerce") -
-                pd.to_datetime(df_sorted["prev_discharge"], errors="coerce")
-            ).dt.days
-            df_sorted["readmit_30d"] = (df_sorted["days_since_discharge"] <= 30).astype(int)
-            df = df_sorted.drop(columns=["prev_discharge"])
-            log_entries.append({"category": "features", "action": "computed_readmit_30d"})
+        df_sorted["days_since_discharge"] = (
+            pd.to_datetime(df_sorted["admit_date"], errors="coerce") -
+            pd.to_datetime(df_sorted["prev_discharge"], errors="coerce")
+        ).dt.days
+        df_sorted["readmit_30d"] = (df_sorted["days_since_discharge"] <= 30).astype(int)
+        # ⚠️ 必须还原行序:否则输出的 03_cleaned 与输入行一一对应关系被破坏,
+        #    下游按行合并/比对会静默错位。
+        df = df_sorted.drop(columns=["prev_discharge"]).reindex(original_order)
+        log_entries.append({"category": "features", "action": "computed_readmit_30d"})
     return df
 
 
 # ─────────────────────────────────────────────
 # Category 15 — Quality Report
 # ─────────────────────────────────────────────
+SCALE_METHODS = ("zscore", "minmax", "robust")
+
+
+# ═══════════════════════════════════════════════
+# 类别 13 — 数据标准化 / 缩放
+# ═══════════════════════════════════════════════
+def standardize_scales(df: pd.DataFrame, method: str = "zscore", columns=None,
+                       log_entries=None, suffix: str = "_scaled"):
+    """标准化/缩放。
+
+    ⚠️ **仅用于建模前**。描述性统计与论文里的原始数值表都不要缩放,否则量纲失去意义。
+
+    默认生成新列 ``<col>_scaled``,**不覆盖原列** —— 缩放不可逆地丢掉尺度,
+    覆盖是这类脚本最常见的事故来源。
+
+    Returns:
+        (df_out, params):params 记录每列的变换参数,可用 apply_scaling() 对
+        新数据(测试集/后续队列)施加**完全相同**的变换。
+    """
+    if method not in SCALE_METHODS:
+        raise ValueError(f"未知缩放方法 {method!r};可选 {SCALE_METHODS}")
+    log_entries = log_entries if log_entries is not None else []
+    df = df.copy()
+    params = {}
+
+    if columns is None:
+        columns = [c for c in df.columns
+                   if pd.api.types.is_numeric_dtype(df[c])
+                   and not c.endswith(("_was_missing", "_flag", suffix))
+                   and not _looks_like_identifier(c)]
+
+    for col in columns:
+        if col not in df.columns:
+            log.warning(f"缩放跳过不存在的列:{col}")
+            continue
+        s = pd.to_numeric(df[col], errors="coerce")
+
+        if method == "zscore":
+            mu, sd = s.mean(), s.std()
+            if pd.isna(sd) or sd == 0:
+                log.warning(f"列 {col} 标准差为 0,跳过 z-score")
+                continue
+            df[f"{col}{suffix}"] = (s - mu) / sd
+            params[col] = {"method": "zscore", "mean": float(mu), "std": float(sd)}
+        elif method == "minmax":
+            lo, hi = s.min(), s.max()
+            if pd.isna(lo) or hi == lo:
+                log.warning(f"列 {col} 取值范围为单点,跳过 min-max")
+                continue
+            df[f"{col}{suffix}"] = (s - lo) / (hi - lo)
+            params[col] = {"method": "minmax", "min": float(lo), "max": float(hi)}
+        else:  # robust:对极端值不敏感,医院数据里比 z-score 更稳
+            med = s.median()
+            iqr = s.quantile(0.75) - s.quantile(0.25)
+            if pd.isna(iqr) or iqr == 0:
+                log.warning(f"列 {col} IQR 为 0,跳过 robust 缩放")
+                continue
+            df[f"{col}{suffix}"] = (s - med) / iqr
+            params[col] = {"method": "robust", "median": float(med), "iqr": float(iqr)}
+
+        log_entries.append({"category": "scaling", "field": col, "action": method})
+
+    if params:
+        log.info(f"已缩放 {len(params)} 列(method={method});参数可用 apply_scaling() 复用")
+    return df, params
+
+
+def apply_scaling(df: pd.DataFrame, params: dict, suffix: str = "_scaled") -> pd.DataFrame:
+    """用 standardize_scales() 返回的 params 对新数据施加**相同**变换。
+
+    训练集/测试集必须用同一套参数,否则既是数据泄漏也是量纲不一致。
+    """
+    df = df.copy()
+    for col, p in params.items():
+        if col not in df.columns:
+            log.warning(f"apply_scaling:目标数据缺少列 {col},跳过")
+            continue
+        s = pd.to_numeric(df[col], errors="coerce")
+        if p["method"] == "zscore":
+            df[f"{col}{suffix}"] = (s - p["mean"]) / p["std"]
+        elif p["method"] == "minmax":
+            span = (p["max"] - p["min"]) or 1
+            df[f"{col}{suffix}"] = (s - p["min"]) / span
+        elif p["method"] == "robust":
+            df[f"{col}{suffix}"] = (s - p["median"]) / (p["iqr"] or 1)
+    return df
+
+
 def generate_quality_report(df_before: pd.DataFrame, df_after: pd.DataFrame,
                               log_entries: list, output_dir: Path) -> str:
     """Generate a markdown quality report."""
@@ -427,6 +727,27 @@ def generate_quality_report(df_before: pd.DataFrame, df_after: pd.DataFrame,
 # ─────────────────────────────────────────────
 # Main Pipeline
 # ─────────────────────────────────────────────
+def _write_dataset(df: pd.DataFrame, output_path: Path, ts: str, log_entries: list) -> Path:
+    """写出清洗后数据集:优先 parquet,缺引擎时退化为 CSV。
+
+    ⚠️ parquet 需要 pyarrow / fastparquet。医院机器上常常没有,
+    若直接 to_parquet 会在流水线**最后一步**抛异常 —— 前面所有清洗都白做。
+    这里退化为 CSV(utf-8-sig,Excel 直接双击不乱码),并把降级记进日志。
+    """
+    target = output_path / f"03_cleaned_{ts}.parquet"
+    try:
+        df.to_parquet(target, index=False)
+        return target
+    except (ImportError, ValueError, AttributeError) as exc:
+        csv_target = output_path / f"03_cleaned_{ts}.csv"
+        df.to_csv(csv_target, index=False, encoding="utf-8-sig")
+        log.warning(f"parquet 写入不可用({type(exc).__name__});已改写 CSV:{csv_target}")
+        log.warning("如需 parquet:pip install pyarrow")
+        log_entries.append({"category": "output", "action": "parquet_unavailable_wrote_csv",
+                            "detail": str(exc)[:120]})
+        return csv_target
+
+
 def run_pipeline(input_path: str, output_dir: str, config: dict = None) -> None:
     config = config or {}
     output_path = Path(output_dir)
@@ -440,7 +761,8 @@ def run_pipeline(input_path: str, output_dir: str, config: dict = None) -> None:
     log.info(f"Loaded {len(df):,} rows from {input_path}")
 
     # Profile raw data
-    raw_profile = profile_data(df)
+    # ⚠️ 画像在脱敏之前生成,默认不输出任何原值,避免 PHI 落盘
+    raw_profile = profile_data(df, include_samples=bool(config.get("profile_samples", False)))
     with open(output_path / "00_profile_raw.json", "w") as f:
         json.dump(raw_profile, f, indent=2, default=str)
 
@@ -451,20 +773,40 @@ def run_pipeline(input_path: str, output_dir: str, config: dict = None) -> None:
     critical_fields = config.get("critical_fields", ["patient_id", "admit_date"])
     dedup_keys      = config.get("dedup_keys",      ["patient_id", "admit_date"])
 
+    # 类别 9 — 先做结构清洗(文本→数值)。否则后续分位数/异常检测会静默跳过文本列
+    df = clean_structure(df, log_entries,
+                         coerce_numeric=bool(config.get("coerce_numeric_types", True)))
+
     df = handle_missing(df, critical_fields, log_entries)
     df = deduplicate(df, dedup_keys, log_entries)
     df = standardize_encodings(df, log_entries)
     df = build_temporal_vars(df, log_entries)
-    df = detect_outliers(df, log_entries)
+    df = detect_outliers(df, log_entries,
+                         null_hard_bound=bool(config.get("null_hard_bound", False)))
     df = check_logic(df, log_entries)
     df = engineer_features(df, log_entries)
 
     if config.get("deidentify", True):
         df = deidentify(df, config.get("keep_pseudonym", False), log_entries)
+    else:
+        log.warning("deidentify=False:输出文件将**保留原始 PHI 列**。"
+                    "仅在已获伦理批准且落盘环境受控时才这样用。")
+        log_entries.append({"category": "deidentify", "action": "skipped_by_config"})
+
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    # 类别 13 — 标准化缩放:默认关闭,只在建模前显式开启
+    scale_method = config.get("scale_method")
+    if scale_method:
+        df, scale_params = standardize_scales(df, method=scale_method,
+                                              columns=config.get("scale_columns"),
+                                              log_entries=log_entries)
+        with open(output_path / f"05_scaler_params_{ts}.json", "w", encoding="utf-8") as f:
+            json.dump(scale_params, f, indent=2, ensure_ascii=False)
+        log.info(f"缩放参数已存:{len(scale_params)} 列 → 05_scaler_params_{ts}.json")
 
     # Save outputs
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    df.to_parquet(output_path / f"03_cleaned_{ts}.parquet", index=False)
+    _write_dataset(df, output_path, ts, log_entries)
 
     log_df = pd.DataFrame(log_entries)
     log_df.to_csv(output_path / f"01_cleaning_log_{ts}.csv", index=False)
@@ -484,11 +826,15 @@ if __name__ == "__main__":
     ap.add_argument("--input",  required=True, help="Input CSV or Parquet file path")
     ap.add_argument("--output", default="output", help="Output directory")
     ap.add_argument("--config", default=None, help="JSON config file path")
+    ap.add_argument("--profile-samples", action="store_true",
+                    help="画像 JSON 中输出每列前 3 个原值。默认关闭;数据含 PHI 时切勿开启")
     args = ap.parse_args()
 
     cfg = {}
     if args.config and os.path.exists(args.config):
-        with open(args.config) as f:
+        with open(args.config, encoding="utf-8") as f:
             cfg = json.load(f)
+    if args.profile_samples:
+        cfg["profile_samples"] = True
 
     run_pipeline(args.input, args.output, cfg)

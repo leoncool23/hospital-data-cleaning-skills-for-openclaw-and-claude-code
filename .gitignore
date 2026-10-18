@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 清洗产物(含 PHI,绝不入库)
+output/
+*.parquet
+00_*.json
+01_*.csv
+02_*.csv
+03_*.csv
+04_*.md
+
+# 原始数据(含 PHI,绝不入库)
+data/
+raw/
+*.csv
+!tests/fixtures/*.csv
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/

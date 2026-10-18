@@ -1,9 +1,38 @@
 ---
 name: hospital-data-cleaning-zh
 description: 医院/公共卫生数据清洗全流程技能。涵盖缺失值处理、异常值检测、重复数据去重、逻辑一致性校验、编码标准化、时间数据处理、隐私脱敏、衍生变量构建、质量评估报告生成。适用于医院HIS/LIS/EMR/PACS导出数据、临床试验数据集、公共卫生监测数据的系统性清洗、校验与质量保障。
+license: MIT
 ---
 
 # 🏥 医院数据清洗技能（完整版）
+
+## 实现状态（先说清楚哪些能跑）
+
+本 SKILL.md 描述 15 类清洗。**当前 12 类有脚本实现**,其余 3 类只有规则描述,
+执行时需要 Agent 自己写代码或人工处理:
+
+| # | 类别 | 脚本实现 | 函数 |
+|---|------|---------|------|
+| 0 | 数据画像 | ✅ | `profile_data()` |
+| 1 | 缺失值处理 | ✅ 部分(中位数插补/删列/指示变量;**无 MICE**) | `handle_missing()` |
+| 2 | 异常值与错误值 | ✅ 部分(硬边界 + IQR;**无单位统一**) | `detect_outliers()` |
+| 3 | 小样本抑制 | ✅ 主抑制 + 二次抑制(单维频数表 / 二维列联表) | `small_count_suppress.py` |
+| 4 | 重复数据处理 | ✅ 部分(完全重复 + 事件级;**无 recordlinkage / MPI**) | `deduplicate()` |
+| 5 | 逻辑一致性校验 | ✅ 部分(时间/性别诊断/年龄;规则可扩展) | `check_logic()` |
+| 6 | 编码与术语标准化 | ✅ 部分(性别/ICD-10 校验/日期;无药品标准化) | `standardize_encodings()` |
+| 7 | 时间数据处理 | ✅ 部分(LOS / 到诊断天数) | `build_temporal_vars()` |
+| 8 | 隐私脱敏 | ✅ 部分(PHI 删除/伪名/年龄分组;**无 k-匿名**) | `deidentify()` |
+| 9 | 数据结构清洗 | ✅ 类型规范(文本→数值)+ 宽长表互转 | `clean_structure()` `to_long()` `to_wide()` |
+| 10 | 文本与 NLP 清洗 | ❌ 无 | — |
+| 11 | 数据来源核对 | ❌ 无(无跨系统对账/血缘) | — |
+| 12 | 衍生变量构建 | ✅ 部分(CCI / BMI / 30 天再入院) | `engineer_features()` `charlson_cci.py` |
+| 13 | 数据标准化/缩放 | ✅ z-score / min-max / robust,变换参数可复用 | `standardize_scales()` `apply_scaling()` |
+| 14 | 数据集成 | ❌ 无 | — |
+| 15 | 质控与可追溯 | ✅ 部分(六维报告降级为完整性+动作日志;无版本控制) | `generate_quality_report()` |
+
+> 标 ❌ 的三类在下面仍有完整规则描述,可按需由 Agent 实现。
+> 脚本入口:`scripts/hospital_cleaner.py`(主流水线)、`scripts/charlson_cci.py`(CCI)、
+> `scripts/small_count_suppress.py`(发布前小计数抑制)。
 
 ## 总览
 
