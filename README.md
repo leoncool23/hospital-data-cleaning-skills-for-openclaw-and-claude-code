@@ -207,4 +207,10 @@ python scripts/small_count_suppress.py --input raw.csv --group 科室 --group �
 
 ## 许可证
 
-MIT — 可自由使用、修改与分发。
+MIT License — 可自由使用、修改与分发。
+
+```
+Copyright (c) 2026 leoncool23
+```
+
+完整条款见 [LICENSE](LICENSE)。
