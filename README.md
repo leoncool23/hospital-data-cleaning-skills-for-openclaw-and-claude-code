@@ -37,18 +37,26 @@ hospital-data-cleaning-zh/
 阅读并应用：.claude/skills/hospital-data-cleaning-zh/SKILL.md
 ```
 
-### OpenClaw — 全局安装（所有 Agent 可用）
+### OpenClaw — 工作区安装（推荐）
+
+把仓库根目录整个拷到 agent 工作区的 `skills/` 下,目录名就是 skill 名:
 
 ```bash
-cp -r hospital-data-cleaning-zh ~/.openclaw/skills/
-openclaw gateway restart
+# macOS / Linux
+git clone https://github.com/leoncool23/hospital-data-cleaning-skills-for-openclaw-and-claude-code.git \
+  ~/.openclaw/workspace/skills/hospital-data-cleaning-zh
+
+# Windows
+# git clone <同上 URL> "%USERPROFILE%\.openclaw\workspace\skills\hospital-data-cleaning-zh"
 ```
 
-### OpenClaw — 工作区安装（指定 Agent 专用）
+**不需要重启 gateway**——skills 会在下一轮对话自动被重新扫描。
+（原版写 `~/.openclaw/skills/` 且要求 `openclaw gateway restart`,两处都不对。）
+
+### 验证安装
 
 ```bash
-cp -r hospital-data-cleaning-zh ~/.openclaw/workspace-<agentId>/skills/
-openclaw gateway restart
+python tests/test_pipeline.py   # 应输出 ALL PASS (17 tests)
 ```
 
 ### OpenClaw 多 Agent 分工
@@ -62,8 +70,14 @@ openclaw gateway restart
 ### 安装依赖
 
 ```bash
-pip install pandas numpy python-dateutil scikit-learn pyarrow recordlinkage
+pip install pandas python-dateutil
 ```
+
+就这两个。`numpy` 随 pandas 自动装;`pyarrow` **可选**,只在需要 parquet 输出时装
+(不装会自动退化为 CSV,并在日志里记一笔降级)。
+
+> 原版 README 列的 `scikit-learn` / `recordlinkage` / `pyarrow` 脚本并未 import。
+> `recordlinkage` 是本包**尚未实现**的概率匹配(见 SKILL.md 第 4 类),引用它会让用户白装几十 MB。
 
 ### 基础运行
 
@@ -87,9 +101,23 @@ python scripts/hospital_cleaner.py \
   "critical_fields": ["患者ID", "入院日期", "ICD10编码"],
   "dedup_keys":      ["患者ID", "入院日期", "检验编码"],
   "deidentify":      true,
-  "keep_pseudonym":  false
+  "keep_pseudonym":  false,
+
+  "profile_samples": false,
+  "null_hard_bound": false
 }
 ```
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `critical_fields` | `["patient_id","admit_date"]` | 缺失时**只标记不插补**的关键字段 |
+| `dedup_keys` | `["patient_id","admit_date"]` | 事件级去重的复合主键 |
+| `deidentify` | `true` | 关掉会**保留 PHI 原列**并打警告 |
+| `keep_pseudonym` | `false` | 姓名是否保留为 `SUBJ_<hash8>` 伪名 |
+| `profile_samples` | `false` | ⚠️ 是否把每列前 3 个**原值**写进画像 JSON。**含 PHI 时绝不要开**(见下方安全说明) |
+| `null_hard_bound` | `false` | 硬边界外的值是否置空。默认只打标记保留原值 |
+
+命令行等价开关:`--profile-samples`。
 
 ---
 
@@ -117,16 +145,19 @@ python scripts/hospital_cleaner.py \
 
 ## 输出文件说明
 
-每次运行后，`output/` 目录下自动生成：
+每次运行后，`output/` 目录下自动生成（**代码里的真实文件名**，均为英文）：
 
 ```
 output/
-├── 00_画像报告_<时间戳>.json       ← 清洗前数据画像
-├── 01_清洗日志_<时间戳>.csv        ← 所有变更记录
-├── 02_标记记录_<时间戳>.csv        ← 问题记录（待人工审核）
-├── 03_清洗数据_<时间戳>.parquet    ← 清洗后数据集
-└── 04_质量报告_<时间戳>.md         ← 人类可读质量报告
+├── 00_profile_raw.json              ← 清洗前数据画像(不含任何原值)
+├── 01_cleaning_log_<时间戳>.csv     ← 所有变更记录
+├── 02_flagged_records_<时间戳>.csv  ← 逻辑问题记录(待人工审核;无问题则不生成)
+├── 03_cleaned_<时间戳>.parquet      ← 清洗后数据集(无 pyarrow 时退化为 .csv)
+└── 04_quality_report_<时间戳>.md    ← 人类可读质量报告
 ```
+
+> 原版 README 写的是「00_画像报告 / 01_清洗日志 / 02_标记记录 / 03_清洗数据 / 04_质量报告」,
+> 与代码实际写出的文件名不一致 —— 按代码为准,本文已改正。
 
 ---
 

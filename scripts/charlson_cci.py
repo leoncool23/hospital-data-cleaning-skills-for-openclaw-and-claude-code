@@ -1,12 +1,23 @@
 """
 charlson_cci.py
 ---------------
-Compute Charlson Comorbidity Index from ICD-10 codes.
-Reference: Quan et al. 2005 (ICD-10 coding algorithm).
+Compute Charlson Comorbidity Index (CCI) from ICD-10 codes.
+
+算法来源:
+    Charlson ME, et al. J Chronic Dis. 1987;40(5):373-83.(原始权重)
+    Quan H, et al. Med Care. 2005;43(11):1130-9.(ICD-10 码表,本文件采用)
+    年龄加权:Charlson 原始文献即含年龄分(0-4),与合并症分相加。
+
+Usage:
+    df = pd.read_csv("diagnoses.csv")          # 一行一条诊断
+    cci = compute_cci(df, icd_col="icd10_code", patient_col="patient_id",
+                      age_col="age_years")
+    # cci 列:patient_id, cci_score, age_points, cci_total, 各分项 0/1 标记
+
+    # 不传 age_col 也大:只算合并症分,不带年龄分
 """
 
 import pandas as pd
-import re
 
 # ICD-10 code ranges for each CCI component (Quan 2005)
 CCI_COMPONENTS = {
@@ -107,6 +118,33 @@ CCI_COMPONENTS = {
     },
 }
 
+# 层级互斥组:(轻, 重)。Charlson 定义里这三组是**互斥**的 ——
+# 同一患者同时命中时只计较重那个,不能相加。
+# 漏了这一步的典型后果:肝癌患者同时有 C34(恶性肿瘤,2)+ C78(转移瘤,6),
+# 会被错算成 8 分而不是 6 分;糖尿病同理。
+HIERARCHICAL_PAIRS = [
+    ("mild_liver_disease", "moderate_severe_liver_disease"),
+    ("diabetes_without_complications", "diabetes_with_complications"),
+    ("any_malignancy", "metastatic_tumor"),
+]
+
+# 年龄加权分(Charlson 原始文献):50-59=1, 60-69=2, 70-79=3, ≥80=4
+AGE_POINTS = [(80, 4), (70, 3), (60, 2), (50, 1)]
+
+
+def charlson_age_points(age) -> int:
+    """按 Charlson 年龄分阶梯返回 0-4 分。缺失/非数值返回 0。"""
+    if age is None or pd.isna(age):
+        return 0
+    try:
+        age = float(age)
+    except (TypeError, ValueError):
+        return 0
+    for threshold, points in AGE_POINTS:
+        if age >= threshold:
+            return points
+    return 0
+
 
 def _icd_matches(icd_code: str, code_list: list) -> bool:
     """Check if ICD code starts with any code in list."""
@@ -117,7 +155,8 @@ def _icd_matches(icd_code: str, code_list: list) -> bool:
 
 
 def compute_cci(df: pd.DataFrame, icd_col: str = "icd10_code",
-                patient_col: str = "patient_id") -> pd.DataFrame:
+                patient_col: str = "patient_id",
+                age_col: str = None) -> pd.DataFrame:
     """
     Compute Charlson Comorbidity Index per patient.
 
@@ -125,31 +164,54 @@ def compute_cci(df: pd.DataFrame, icd_col: str = "icd10_code",
         df: DataFrame with one row per diagnosis per patient
         icd_col: Column name containing ICD-10 codes
         patient_col: Column name for patient identifier
+        age_col: 年龄列名。给了就算年龄分并输出 cci_total;不给就只输出合并症分
 
     Returns:
-        DataFrame with patient_id and cci_score
+        DataFrame with patient_id, cci_score(仅合并症), 各分项 0/1 标记;
+        若提供了 age_col,额外多 age_points 与 cci_total(= cci_score + age_points)。
+
+    ⚠️ 论文报告时**必须写清用的是哪一种**:只报合并症分(常记 CCI)还是含年龄分
+       (常记 CCI-age / Charlson age-comorbidity index)。两者数值不同,不可混用。
     """
-    # Build patient × diagnosis matrix
+    has_age = bool(age_col) and age_col in df.columns
     results = []
     for patient_id, group in df.groupby(patient_col):
         codes = group[icd_col].dropna().tolist()
-        score = 0
         flags = {}
         for component, info in CCI_COMPONENTS.items():
-            present = any(_icd_matches(c, info["codes"]) for c in codes)
-            flags[component] = int(present)
-            if present:
-                score += info["weight"]
-        results.append({patient_col: patient_id, "cci_score": score, **flags})
+            flags[component] = int(any(_icd_matches(c, info["codes"]) for c in codes))
+
+        # 层级互斥:轻症让位于重症,否则同一疾病被重复计分
+        for mild, severe in HIERARCHICAL_PAIRS:
+            if flags[mild] and flags[severe]:
+                flags[mild] = 0
+
+        score = sum(CCI_COMPONENTS[c]["weight"] for c, present in flags.items() if present)
+        row = {patient_col: patient_id, "cci_score": score, **flags}
+
+        if has_age:
+            age = group[age_col].dropna()
+            age_value = age.iloc[0] if len(age) else None
+            points = charlson_age_points(age_value)
+            row["age_years"] = age_value
+            row["age_points"] = points
+            row["cci_total"] = score + points
+        results.append(row)
     return pd.DataFrame(results)
 
 
 if __name__ == "__main__":
     # Demo
     demo = pd.DataFrame({
-        "patient_id": ["P001", "P001", "P002"],
-        "icd10_code": ["I50.0", "E11.9", "C34.1"],
+        "patient_id": ["P001", "P001", "P002", "P003", "P003", "P004"],
+        "icd10_code": ["I50.0", "E11.9", "C34.1", "K73.9", "K72.9", "E11.0"],
+        "age_years":  [72, 72, 45, 81, 81, 58],
     })
-    cci = compute_cci(demo)
-    print(cci[["patient_id", "cci_score", "congestive_heart_failure",
-               "diabetes_without_complications", "any_malignancy"]])
+    cci = compute_cci(demo, age_col="age_years")
+    cols = ["patient_id", "cci_score", "age_points", "cci_total",
+            "congestive_heart_failure", "diabetes_without_complications",
+            "mild_liver_disease", "moderate_severe_liver_disease", "any_malignancy"]
+    print(cci[[c for c in cols if c in cci.columns]].to_string(index=False))
+    print()
+    print("P003 同时有 K73(轻度肝病)与 K72(中重度肝病)→ 只计中重度 3 分,不叠加为 4")
+    print("P001 同时有 I50(心衰)与 E11.9(糖尿病无并发症)→ 1+1=2,加年龄分 3 = 5")
